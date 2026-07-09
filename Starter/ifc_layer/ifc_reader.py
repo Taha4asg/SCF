@@ -158,9 +158,15 @@ def extract_storey(model, storey, spaces):
     # (Stage 3 vertical anchors).
     stair_polys = []
     for s_el in contained_elements(model, storey, ("IfcStair", "IfcStairFlight")):
-        p = element_footprint(s_el)
-        if p is not None and not p.is_empty:
-            stair_polys.append(p)
+        # IfcStair is often a geometry-less AGGREGATE: its body lives on
+        # child parts (flights, landings) linked by IfcRelAggregates.
+        parts = [s_el]
+        for rel in getattr(s_el, "IsDecomposedBy", []) or []:
+            parts.extend(rel.RelatedObjects)
+        for part in parts:
+            p = element_footprint(part)
+            if p is not None and not p.is_empty:
+                stair_polys.append(p)
 
     door_recs = []
     door_cut = []
@@ -179,9 +185,11 @@ def extract_storey(model, storey, spaces):
 
     # -- access graph via doors (D4) ------------------------------------------
     access_edges = []
+    MIN_TOUCH_AREA = 0.02   # ignore grazing near-zero contacts (float hairlines)
     for d in door_recs:
         reach = d["poly"].buffer(TOUCH_BUFFER)
-        touching = [r["guid"] for r in space_recs if r["poly"].intersects(reach)]
+        touching = [r["guid"] for r in space_recs
+                    if r["poly"].intersection(reach).area > MIN_TOUCH_AREA]
         if len(touching) >= 2:
             # connect the two largest-overlap spaces (robust to grazing thirds)
             touching = sorted(
@@ -195,6 +203,20 @@ def extract_storey(model, storey, spaces):
             d["connects"] = [touching[0], "EXTERIOR"]
         else:
             d["connects"] = []
+
+    # -- D10: exterior-touch (carrier exposure, recorded not yet scored) -------
+    # A room "touches the carrier" if its footprint borders the outer edge of
+    # the building. Cheap to record now (we have land + walls); becomes a
+    # second privacy axis later without rework. Measured as the length of the
+    # room's boundary that lies on the land's outer boundary.
+    # buffer past the outer wall thickness (rooms end at the INNER face, the
+    # land boundary is at the OUTER face ~one wall away); measure frontage
+    # against the land's outer boundary.
+    land_boundary = land.boundary
+    wall_reach = 0.45  # slightly more than a typical exterior wall thickness
+    for r in space_recs:
+        shared = r["poly"].buffer(wall_reach).intersection(land_boundary)
+        r["exterior_touch"] = round(shared.length, 2) if not shared.is_empty else 0.0
 
     # -- adjacency graph (D4) --------------------------------------------------
     adjacency_edges = []
@@ -227,11 +249,17 @@ def extract_storey(model, storey, spaces):
     # points, but their enclosure comes from their own walls.
     stair_obstacle = make_valid(unary_union(stair_polys)) if stair_polys else Polygon()
 
+    # stair-space detection: NAME match OR GEOMETRIC overlap with a stair
+    # element (>30% of the space) — real models mislabel stair spaces
+    # (Duplex unit B: LongName 'Room'); geometry does not lie.
     STAIR_WORDS = ("stair", "treppe", "escalier")
     space_zone_polys = []
     for r in space_recs:
         label = f"{r['long_name']} {r['name']}".lower()
-        r["is_stair"] = any(w in label for w in STAIR_WORDS)
+        by_name = any(w in label for w in STAIR_WORDS)
+        by_geom = (not stair_obstacle.is_empty and
+                   r["poly"].intersection(stair_obstacle).area > 0.30 * r["poly"].area)
+        r["is_stair"] = by_name or by_geom
         if r["is_stair"]:
             space_zone_polys.append(r["poly"])
     stair_space_zone = make_valid(unary_union(space_zone_polys)) if space_zone_polys else Polygon()
@@ -274,4 +302,9 @@ def scoring_inputs(st):
     exclusion = stair-named spaces (transparent, point-free)."""
     stair_simple = stair_vision_hull(st)
     wall_vision = make_valid(unary_union([st["wall"], stair_simple]))
+    # D9: vision-geometry simplification. Authoring-tool wall joins fragment
+    # the polygon (Duplex: 938 segments -> 23 min/storey); a 2 cm topological
+    # simplification (far below perceptual relevance) restores tractability
+    # (389 segments -> ~4.5 min) with geometry unchanged beyond tolerance.
+    wall_vision = wall_vision.simplify(0.02, preserve_topology=True)
     return st["land"], wall_vision, st["stair_space_zone"]
