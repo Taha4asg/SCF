@@ -149,23 +149,41 @@ def build_scp_graph(storey, df_scored, wall_solid=None, entrances=None):
     for r in spaces:
         pts = df[df.room_guid == r["guid"]]
         n = len(pts)
+        cen = r["poly"].centroid
         base = dict(kind="room", long_name=r["long_name"], name=r["name"],
                     area=round(r["poly"].area, 2),
+                    centroid=(round(cen.x, 3), round(cen.y, 3)),
                     exterior_touch=touch_of[r["guid"]])  # D10: carrier exposure
         if r.get("is_stair") or n == 0:
             G.add_node(r["guid"], is_stair=bool(r.get("is_stair")), n_points=n,
                        prospect=None, variety=None, mix=None,
-                       mix_entropy=None, reliable=False, **base)
+                       mix_entropy=None, cv_mean=None, ov_mean=None,
+                       complexity=None, reliable=False, **base)
             continue
         q = pts.quality_score.values
         mix = {t: round(float((pts.spatial_type == t).mean()), 4)
                for t in TYPOLOGIES}
         probs = np.array([v for v in mix.values() if v > 0])
         entropy = max(0.0, float(-(probs * np.log2(probs)).sum())) if len(probs) else 0.0
+        # PERCEPTUAL complexity axis (Wiener et al. 2007; Dosen & Ostwald 2016).
+        # Reuses features every scored point already carries — NO new geometry:
+        #   Cv = circularity = 4*pi*Area/Perimeter^2 (low Cv = broken-up outline)
+        #   Ov = occlusivity = hidden-edge fraction  (high Ov = much hidden)
+        # complexity: broken-up AND occluded boundary -> high. 0..100, plan-free.
+        # (Reachability is a SEPARATE, configurational axis — see structure.py
+        # legibility_tier — do not conflate the two; that was the Flur lesson.)
+        if {"Cv", "Ov"}.issubset(pts.columns):
+            cv_mean = float(pts.Cv.mean()); ov_mean = float(pts.Ov.mean())
+            complexity = round(100.0 * (1.0 - cv_mean) * (0.5 + 0.5 * ov_mean), 2)
+        else:
+            cv_mean = ov_mean = complexity = None
         G.add_node(r["guid"], is_stair=False, n_points=n,
                    prospect=round(float(q.mean()), 2),
                    variety=round(float(q.std()), 2),
                    mix=mix, mix_entropy=round(entropy, 3),
+                   cv_mean=None if cv_mean is None else round(cv_mean, 4),
+                   ov_mean=None if ov_mean is None else round(ov_mean, 4),
+                   complexity=complexity,
                    reliable=n >= MIN_POINTS_RELIABLE, **base)
 
     # ---- edges: width + BOTH jumps (room-average and local-at-threshold) ----
@@ -192,10 +210,14 @@ def build_scp_graph(storey, df_scored, wall_solid=None, entrances=None):
         # Appleton 1984); fall back to the room-average difference where a
         # threshold lacks enough nearby scored points on both sides.
         jump = jump_local if jump_local is not None else jump_avg
+        txy = None
+        if thresh_geom is not None and not thresh_geom.is_empty:
+            tc = thresh_geom.centroid
+            txy = (round(tc.x, 3), round(tc.y, 3))
         G.add_edge(a, b, kind=kind, width=width, jump=jump,
                    jump_local=jump_local, jump_avg=jump_avg,
                    jump_source=("local" if jump_local is not None else "average"),
-                   door_guid=guid)
+                   thresh_xy=txy, door_guid=guid)
 
     # ---- entrances: designer choice, else auto-primary (widest exterior door) ----
     ext_doors = [(rm, tag) for rm, other, tag in
@@ -218,8 +240,11 @@ def build_scp_graph(storey, df_scored, wall_solid=None, entrances=None):
         elif len(ext_doors) == 1:
             chosen = {ext_doors[0][0]}
         else:
-            widest = max(ext_doors, key=lambda rd: _clear_width(door_poly.get(rd[1])) or 0)
-            chosen = {widest[0]}
+            # Multiple exterior doors and no name hint (e.g. a two-unit
+            # duplex with one front door per unit): guessing ONE would
+            # strand whole units with misleading depths. Default to ALL
+            # exterior doors (pure-Hillier), flagged for confirmation.
+            chosen = {rd[0] for rd in ext_doors}
         entrance_is_guess = True
     else:
         chosen = set()
@@ -230,8 +255,15 @@ def build_scp_graph(storey, df_scored, wall_solid=None, entrances=None):
             G.remove_edge(rm, CARRIER)
     for rm, tag in ext_doors:
         if rm in chosen:
-            G.add_edge(rm, CARRIER, kind="door", width=_clear_width(door_poly.get(tag)),
-                       jump=None, jump_local=None, door_guid=tag, is_entrance=True)
+            dp = door_poly.get(tag)
+            txy = None
+            if dp is not None and not dp.is_empty:
+                tc = dp.centroid
+                txy = (round(tc.x, 3), round(tc.y, 3))
+            G.add_edge(rm, CARRIER, kind="door", width=_clear_width(dp),
+                       jump=None, jump_local=None, jump_avg=None,
+                       jump_source=None, thresh_xy=txy,
+                       door_guid=tag, is_entrance=True)
     G.graph["entrances"] = sorted(chosen)
     G.graph["exterior_doors"] = [rm for rm, _ in ext_doors]
     G.graph["entrance_is_guess"] = entrance_is_guess  # True => designer should confirm
